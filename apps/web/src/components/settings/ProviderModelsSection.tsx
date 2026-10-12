@@ -96,9 +96,10 @@ function describeModelCapabilities(model: ServerProviderModel): string[] {
 /**
  * Display order for the models list: favorites first (in user order), then
  * visible models, then hidden ones. Hidden models sink so the list reads
- * top-down as "what the picker shows"; moves only swap rows within the same
- * group, and the resulting display order is what gets persisted as
- * `modelOrder`.
+ * top-down as "what the picker shows"; a drag inside the list either swaps
+ * rows within one group or crosses the hidden boundary and flips the moved
+ * model's picker visibility. The resulting display order is what gets
+ * persisted as `modelOrder`.
  */
 export function groupModelsForDisplay<
   T extends { readonly slug: string; readonly isCustom: boolean },
@@ -139,26 +140,50 @@ export function nextHiddenModelsForBulkToggle(
 }
 
 /**
- * Arbitrary-position reorder for drag-and-drop. Mirrors `handleMove`'s
- * same-group constraint (favorites / visible / hidden never mix), but moves
- * the active slug to the dropped-on slug's position instead of swapping one
- * step. Returns the full display-order slug array, or `null` when the drop
- * is a no-op or crosses groups.
+ * Result of a model drag: the new full display-order slug array, plus the new
+ * hidden-model list when the drop crossed the hidden boundary (`null` when the
+ * move stayed inside one group).
+ */
+export interface ModelDragResult {
+  readonly order: string[];
+  readonly hiddenModels: string[] | null;
+}
+
+/**
+ * Arbitrary-position reorder for drag-and-drop. Moves the active slug to the
+ * dropped-on slug's position and returns the full display order.
+ *
+ * A drop that crosses the hidden boundary also flips the dragged model's
+ * picker visibility: a hidden row dropped into the picker list is shown at
+ * that position, and a visible row dropped into the hidden section is hidden
+ * there. Favorites never mix with either group. Returns `null` for a no-op
+ * drop or an illegal one.
  *
  * Pure so it can be unit-tested without rendering.
  */
-export function reorderDisplaySlugsForDrag(
+export function reorderModelsForDrag(
   displaySlugs: ReadonlyArray<string>,
   activeSlug: string,
   overSlug: string | null,
   groupOfSlug: (slug: string) => string,
-): string[] | null {
+  hiddenModels: ReadonlyArray<string>,
+): ModelDragResult | null {
   if (overSlug === null || activeSlug === overSlug) return null;
   const fromIndex = displaySlugs.indexOf(activeSlug);
   const toIndex = displaySlugs.indexOf(overSlug);
   if (fromIndex < 0 || toIndex < 0) return null;
-  if (groupOfSlug(activeSlug) !== groupOfSlug(overSlug)) return null;
-  return arrayMove([...displaySlugs], fromIndex, toIndex);
+  const order = arrayMove([...displaySlugs], fromIndex, toIndex);
+  const fromGroup = groupOfSlug(activeSlug);
+  const toGroup = groupOfSlug(overSlug);
+  if (fromGroup === toGroup) return { order, hiddenModels: null };
+  const crossesHiddenBoundary =
+    (fromGroup === "hidden" && toGroup === "visible") ||
+    (fromGroup === "visible" && toGroup === "hidden");
+  if (!crossesHiddenBoundary) return null;
+  const nextHidden = new Set(hiddenModels);
+  if (fromGroup === "hidden") nextHidden.delete(activeSlug);
+  else nextHidden.add(activeSlug);
+  return { order, hiddenModels: [...nextHidden] };
 }
 
 /**
@@ -422,8 +447,10 @@ export function ProviderModelsSection({
     return () => document.removeEventListener("keydown", claimEscape, true);
   }, [isDragging]);
 
-  // Rows only trade places with a neighbour in the same group (favorites,
-  // visible, hidden), and the display order is persisted as the new order.
+  // Rows trade places with the row they're dropped on, and the display order is
+  // persisted as the new order. A drop across the hidden boundary additionally
+  // flips the dragged model's picker visibility (hidden row into the picker
+  // list, visible row into the hidden section). Favorites never mix.
   const groupOf = (model: (typeof displayModels)[number]) =>
     favoriteModelSet.has(model.slug)
       ? "favorite"
@@ -433,16 +460,21 @@ export function ProviderModelsSection({
   const handleDragEnd = (event: DragEndEvent) => {
     setIsDragging(false);
     if (!canWritePreferences || isFiltering) return;
+    const activeSlug = String(event.active.id);
+    if (!event.over) return;
     const slugToGroup = new Map(
       displayModels.map((model) => [model.slug, groupOf(model)] as const),
     );
-    const next = reorderDisplaySlugsForDrag(
+    const result = reorderModelsForDrag(
       displayModels.map((model) => model.slug),
-      String(event.active.id),
-      event.over ? String(event.over.id) : null,
+      activeSlug,
+      String(event.over.id),
       (slug) => slugToGroup.get(slug) ?? "",
+      hiddenModels,
     );
-    if (next) onModelOrderChange(next);
+    if (!result) return;
+    onModelOrderChange(result.order);
+    if (result.hiddenModels) onHiddenModelsChange(result.hiddenModels, [activeSlug]);
   };
   const handleMove = (slug: string, direction: -1 | 1) => {
     if (!canWritePreferences) return;
