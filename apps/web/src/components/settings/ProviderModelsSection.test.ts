@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 import type { ServerProviderModel } from "@t3tools/contracts";
 
-import { groupModelsForDisplay, nextHiddenModelsForBulkToggle } from "./ProviderModelsSection";
+import { groupModelsForDisplay, nextHiddenModelsForBulkToggle, reorderDisplaySlugsForDrag } from "./ProviderModelsSection";
 
 function model(slug: string, isCustom = false): ServerProviderModel {
   return { slug, name: slug, isCustom, capabilities: null };
@@ -22,6 +22,43 @@ describe("groupModelsForDisplay", () => {
   });
 });
 
+describe("reorderDisplaySlugsForDrag", () => {
+  const groupOf = (slug: string) => (slug === "h1" || slug === "h2" ? "hidden" : "visible");
+
+  it("moves a bottom slug to the top within the same group", () => {
+    expect(
+      reorderDisplaySlugsForDrag(["a", "b", "c", "d"], "d", "a", groupOf),
+    ).toEqual(["d", "a", "b", "c"]);
+  });
+
+  it("moves a slug down to an arbitrary position", () => {
+    expect(
+      reorderDisplaySlugsForDrag(["a", "b", "c", "d"], "a", "c", groupOf),
+    ).toEqual(["b", "c", "a", "d"]);
+  });
+
+  it("returns null for no-op drops", () => {
+    expect(reorderDisplaySlugsForDrag(["a", "b"], "a", "a", groupOf)).toBeNull();
+    expect(reorderDisplaySlugsForDrag(["a", "b"], "a", null, groupOf)).toBeNull();
+  });
+
+  it("refuses drops across groups", () => {
+    expect(
+      reorderDisplaySlugsForDrag(["a", "b", "h1", "h2"], "b", "h1", groupOf),
+    ).toBeNull();
+  });
+
+  it("reorders within the hidden group", () => {
+    expect(
+      reorderDisplaySlugsForDrag(["a", "h1", "h2"], "h2", "h1", groupOf),
+    ).toEqual(["a", "h2", "h1"]);
+  });
+
+  it("returns null for unknown slugs", () => {
+    expect(reorderDisplaySlugsForDrag(["a", "b"], "zzz", "a", groupOf)).toBeNull();
+    expect(reorderDisplaySlugsForDrag(["a", "b"], "a", "zzz", groupOf)).toBeNull();
+  });
+});
 describe("nextHiddenModelsForBulkToggle", () => {
   it("hides every built-in model without hiding custom models", () => {
     const models = [model("a"), model("b"), model("custom", true)];

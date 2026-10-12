@@ -1,7 +1,33 @@
 "use client";
 
-import { ArrowDownIcon, ArrowUpIcon, PencilIcon, PlusIcon, StarIcon, XIcon } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  DndContext,
+  type DragEndEvent,
+  KeyboardSensor,
+  PointerSensor,
+  closestCenter,
+  useSensor,
+  useSensors,
+} from "@dnd-kit/core";
+import { restrictToFirstScrollableAncestor, restrictToVerticalAxis } from "@dnd-kit/modifiers";
+import {
+  SortableContext,
+  arrayMove,
+  sortableKeyboardCoordinates,
+  useSortable,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
+import { CSS as DndKitCSS } from "@dnd-kit/utilities";
+import {
+  ArrowDownIcon,
+  ArrowUpIcon,
+  GripVerticalIcon,
+  PencilIcon,
+  PlusIcon,
+  StarIcon,
+  XIcon,
+} from "lucide-react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   ProviderDriverKind,
   type ProviderInstanceId,
@@ -110,6 +136,89 @@ export function nextHiddenModelsForBulkToggle(
   }
 
   return [...new Set([...hiddenModels, ...builtInSlugs])];
+}
+
+/**
+ * Arbitrary-position reorder for drag-and-drop. Mirrors `handleMove`'s
+ * same-group constraint (favorites / visible / hidden never mix), but moves
+ * the active slug to the dropped-on slug's position instead of swapping one
+ * step. Returns the full display-order slug array, or `null` when the drop
+ * is a no-op or crosses groups.
+ *
+ * Pure so it can be unit-tested without rendering.
+ */
+export function reorderDisplaySlugsForDrag(
+  displaySlugs: ReadonlyArray<string>,
+  activeSlug: string,
+  overSlug: string | null,
+  groupOfSlug: (slug: string) => string,
+): string[] | null {
+  if (overSlug === null || activeSlug === overSlug) return null;
+  const fromIndex = displaySlugs.indexOf(activeSlug);
+  const toIndex = displaySlugs.indexOf(overSlug);
+  if (fromIndex < 0 || toIndex < 0) return null;
+  if (groupOfSlug(activeSlug) !== groupOfSlug(overSlug)) return null;
+  return arrayMove([...displaySlugs], fromIndex, toIndex);
+}
+
+/**
+ * One draggable model row. The grip button is the only drag activator (whole
+ * rows don't drag), mirroring `EnvironmentRoutesList`, so text selection and
+ * the star / arrow / switch controls keep working. The up/down arrows stay as
+ * the keyboard / non-drag alternative.
+ */
+function SortableModelRow({
+  id,
+  slug,
+  modelName,
+  position,
+  disabled,
+  isHidden,
+  children,
+}: {
+  readonly id: string;
+  readonly slug: string;
+  readonly modelName: string;
+  readonly position: number;
+  readonly disabled: boolean;
+  readonly isHidden: boolean;
+  readonly children: ReactNode;
+}) {
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    setActivatorNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id, disabled });
+
+  return (
+    <div
+      ref={setNodeRef}
+      data-model-slug={slug}
+      style={{ transform: DndKitCSS.Translate.toString(transform), transition }}
+      className={cn(
+        "grid h-7 grid-cols-[auto_1.5rem_minmax(0,1fr)_auto_minmax(5.5rem,auto)_auto] items-center gap-2 rounded-md px-2 transition-colors hover:bg-muted/30",
+        isHidden && "opacity-50",
+        isDragging && "relative z-10 bg-background shadow-md",
+      )}
+    >
+      <button
+        type="button"
+        ref={setActivatorNodeRef}
+        {...attributes}
+        {...listeners}
+        disabled={disabled}
+        aria-label={`Reorder ${modelName}, position ${position}`}
+        className="flex size-5 shrink-0 cursor-grab touch-none items-center justify-center rounded text-muted-foreground/70 outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring disabled:cursor-default disabled:opacity-40 active:cursor-grabbing"
+      >
+        <GripVerticalIcon className="size-3" />
+      </button>
+      {children}
+    </div>
+  );
 }
 
 interface ProviderModelsSectionProps {
@@ -296,6 +405,23 @@ export function ProviderModelsSection({
     onToggleFavorite(slug);
   };
 
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
+  // While a drag is active Escape must not also trigger the settings
+  // page's Escape-to-go-back: a pointer drag has no other use for the key.
+  // (A keyboard drag is already cancelled — with preventDefault — by dnd-kit.)
+  const [isDragging, setIsDragging] = useState(false);
+  useEffect(() => {
+    if (!isDragging) return;
+    const claimEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") event.preventDefault();
+    };
+    document.addEventListener("keydown", claimEscape, true);
+    return () => document.removeEventListener("keydown", claimEscape, true);
+  }, [isDragging]);
+
   // Rows only trade places with a neighbour in the same group (favorites,
   // visible, hidden), and the display order is persisted as the new order.
   const groupOf = (model: (typeof displayModels)[number]) =>
@@ -304,6 +430,20 @@ export function ProviderModelsSection({
       : !model.isCustom && hiddenModelSet.has(model.slug)
         ? "hidden"
         : "visible";
+  const handleDragEnd = (event: DragEndEvent) => {
+    setIsDragging(false);
+    if (!canWritePreferences || isFiltering) return;
+    const slugToGroup = new Map(
+      displayModels.map((model) => [model.slug, groupOf(model)] as const),
+    );
+    const next = reorderDisplaySlugsForDrag(
+      displayModels.map((model) => model.slug),
+      String(event.active.id),
+      event.over ? String(event.over.id) : null,
+      (slug) => slugToGroup.get(slug) ?? "",
+    );
+    if (next) onModelOrderChange(next);
+  };
   const handleMove = (slug: string, direction: -1 | 1) => {
     if (!canWritePreferences) return;
     const index = displayModels.findIndex((model) => model.slug === slug);
@@ -453,7 +593,7 @@ export function ProviderModelsSection({
     </Tooltip>
   );
 
-  const renderRow = (model: DisplayModel) => {
+  const renderRowInner = (model: DisplayModel) => {
     const capLabels = describeModelCapabilities(model);
     const group = groupOf(model);
     // Hidden is read from the preference itself: a favorited model can still be
@@ -470,6 +610,40 @@ export function ProviderModelsSection({
     const canMoveDown = !isFiltering && nextModel !== undefined && groupOf(nextModel) === group;
     const nameClassName = cn("text-xs", isHidden ? "text-muted-foreground" : "text-foreground/90");
 
+    return {
+      isHidden,
+      content: (
+        <>
+          {starButton(model, isFavorite)}
+          <span className="flex min-w-0 items-baseline gap-2">
+            <span className={cn(nameClassName, "truncate")}>{model.name}</span>
+            {model.name !== model.slug ? (
+              <code className="truncate font-mono text-2xs text-muted-foreground/70">
+                {model.slug}
+              </code>
+            ) : null}
+            {model.isCustom ? (
+              <span className="text-2xs text-muted-foreground/70">custom</span>
+            ) : null}
+          </span>
+          {/*
+            Always a grid item so the columns line up across rows; the text
+            itself drops out on phone widths where it would starve the name.
+          */}
+          <span className="text-2xs text-muted-foreground/70">
+            {capLabels.length > 0 ? (
+              <span className="hidden sm:inline">{capLabels.join(" · ")}</span>
+            ) : null}
+          </span>
+          {rowActions(model, { isHidden, canMoveUp, canMoveDown })}
+          {pickerSwitch(model, isHidden)}
+        </>
+      ),
+    };
+  };
+
+  const renderRow = (model: DisplayModel) => {
+    const { isHidden, content } = renderRowInner(model);
     return (
       <div
         key={`${instanceId}:${model.slug}`}
@@ -481,30 +655,25 @@ export function ProviderModelsSection({
           isHidden && "opacity-50",
         )}
       >
-        {starButton(model, isFavorite)}
-        <span className="flex min-w-0 items-baseline gap-2">
-          <span className={cn(nameClassName, "truncate")}>{model.name}</span>
-          {model.name !== model.slug ? (
-            <code className="truncate font-mono text-2xs text-muted-foreground/70">
-              {model.slug}
-            </code>
-          ) : null}
-          {model.isCustom ? (
-            <span className="text-2xs text-muted-foreground/70">custom</span>
-          ) : null}
-        </span>
-        {/*
-          Always a grid item so the columns line up across rows; the text
-          itself drops out on phone widths where it would starve the name.
-        */}
-        <span className="text-2xs text-muted-foreground/70">
-          {capLabels.length > 0 ? (
-            <span className="hidden sm:inline">{capLabels.join(" · ")}</span>
-          ) : null}
-        </span>
-        {rowActions(model, { isHidden, canMoveUp, canMoveDown })}
-        {pickerSwitch(model, isHidden)}
+        {content}
       </div>
+    );
+  };
+
+  const renderSortableRow = (model: DisplayModel, position: number) => {
+    const { isHidden, content } = renderRowInner(model);
+    return (
+      <SortableModelRow
+        key={`${instanceId}:${model.slug}`}
+        id={model.slug}
+        slug={model.slug}
+        modelName={model.name}
+        position={position}
+        disabled={!canWritePreferences}
+        isHidden={isHidden}
+      >
+        {content}
+      </SortableModelRow>
     );
   };
 
@@ -574,40 +743,95 @@ export function ProviderModelsSection({
             {isFiltering ? "No models match." : "No models reported for this provider yet."}
           </p>
         ) : null}
-        {visibleModels.map((model, index) => {
-          const group = groupOf(model);
-          const previous = visibleModels[index - 1];
-          const startsGroup = previous === undefined || groupOf(previous) !== group;
-          const editingEntry =
-            canManageCustomModels && model.isCustom && editingSlug === model.slug
-              ? customModels.find((entry) => entry.slug === model.slug)
-              : undefined;
-          return (
-            <div key={`${instanceId}:${model.slug}:group`}>
-              {startsGroup && favoriteCount > 0 && group === "favorite"
-                ? groupLabel("Favorites", index === 0)
-                : null}
-              {startsGroup && favoriteCount > 0 && group === "visible"
-                ? groupLabel("All", index === 0)
-                : null}
-              {startsGroup && group === "hidden"
-                ? groupLabel("Hidden from picker", index === 0)
-                : null}
-              {renderRow(model)}
-              {editingEntry ? (
-                <CustomModelEditor
-                  key={`${instanceId}:${model.slug}:editor`}
-                  instanceId={instanceId}
-                  driverKind={driverKind}
-                  entry={editingEntry}
-                  builtInModels={builtInModels}
-                  onSave={handleSaveEdit}
-                  onCancel={() => setEditingSlug(null)}
-                />
-              ) : null}
-            </div>
-          );
-        })}
+        {isFiltering ? (
+          visibleModels.map((model, index) => {
+            const group = groupOf(model);
+            const previous = visibleModels[index - 1];
+            const startsGroup = previous === undefined || groupOf(previous) !== group;
+            const editingEntry =
+              canManageCustomModels && model.isCustom && editingSlug === model.slug
+                ? customModels.find((entry) => entry.slug === model.slug)
+                : undefined;
+            return (
+              <div key={`${instanceId}:${model.slug}:group`}>
+                {startsGroup && favoriteCount > 0 && group === "favorite"
+                  ? groupLabel("Favorites", index === 0)
+                  : null}
+                {startsGroup && favoriteCount > 0 && group === "visible"
+                  ? groupLabel("All", index === 0)
+                  : null}
+                {startsGroup && group === "hidden"
+                  ? groupLabel("Hidden from picker", index === 0)
+                  : null}
+                {renderRow(model)}
+                {editingEntry ? (
+                  <CustomModelEditor
+                    key={`${instanceId}:${model.slug}:editor`}
+                    instanceId={instanceId}
+                    driverKind={driverKind}
+                    entry={editingEntry}
+                    builtInModels={builtInModels}
+                    onSave={handleSaveEdit}
+                    onCancel={() => setEditingSlug(null)}
+                  />
+                ) : null}
+              </div>
+            );
+          })
+        ) : (
+          <DndContext
+            sensors={sensors}
+            collisionDetection={closestCenter}
+            // Rows sit in per-item wrapper divs (group labels, inline editor),
+            // so restrictToParentElement would clamp each row to its own
+            // wrapper and freeze dragging. Constrain to the scrollable list
+            // instead.
+            modifiers={[restrictToVerticalAxis, restrictToFirstScrollableAncestor]}
+            onDragStart={() => setIsDragging(true)}
+            onDragCancel={() => setIsDragging(false)}
+            onDragEnd={handleDragEnd}
+          >
+            <SortableContext
+              items={displayModels.map((model) => model.slug)}
+              strategy={verticalListSortingStrategy}
+            >
+              {displayModels.map((model, index) => {
+                const group = groupOf(model);
+                const previous = displayModels[index - 1];
+                const startsGroup = previous === undefined || groupOf(previous) !== group;
+                const editingEntry =
+                  canManageCustomModels && model.isCustom && editingSlug === model.slug
+                    ? customModels.find((entry) => entry.slug === model.slug)
+                    : undefined;
+                return (
+                  <div key={`${instanceId}:${model.slug}:group`}>
+                    {startsGroup && favoriteCount > 0 && group === "favorite"
+                      ? groupLabel("Favorites", index === 0)
+                      : null}
+                    {startsGroup && favoriteCount > 0 && group === "visible"
+                      ? groupLabel("All", index === 0)
+                      : null}
+                    {startsGroup && group === "hidden"
+                      ? groupLabel("Hidden from picker", index === 0)
+                      : null}
+                    {renderSortableRow(model, index + 1)}
+                    {editingEntry ? (
+                      <CustomModelEditor
+                        key={`${instanceId}:${model.slug}:editor`}
+                        instanceId={instanceId}
+                        driverKind={driverKind}
+                        entry={editingEntry}
+                        builtInModels={builtInModels}
+                        onSave={handleSaveEdit}
+                        onCancel={() => setEditingSlug(null)}
+                      />
+                    ) : null}
+                  </div>
+                );
+              })}
+            </SortableContext>
+          </DndContext>
+        )}
       </div>
 
       {driverKind === "antigravity" || !canManageCustomModels ? null : isAdding ? (
